@@ -6,6 +6,8 @@ import earth.worldwind.render.program.DirectionalDepthProgram
 import earth.worldwind.render.AbstractRenderable
 import earth.worldwind.render.Color
 import earth.worldwind.render.RenderContext
+import earth.worldwind.render.Texture
+import earth.worldwind.render.program.SensorFrameImageProgram
 import earth.worldwind.render.program.SensorFrameProgram
 import earth.worldwind.geom.Sector
 import kotlin.math.PI
@@ -36,6 +38,11 @@ import kotlin.math.tan
  * That costs one depth pass of the visible terrain per sensor, on the GPU; it needs depth
  * textures (GLES 3, WebGL 2, desktop GL 3), and without them the frames are drawn unoccluded.
  *
+ * A frame can also carry the sensor's own [image][Frame.image], a photo or live video: it is
+ * projected through the frame onto the terrain, exact over relief, and with occlusion kept off
+ * ground the sensor cannot see. Set the sensor from the platform and sensor angles a video's
+ * telemetry carries with [setFromPlatformAndSensorPose] so the image and the frame line up.
+ *
  * What it does not do:
  *  - Occlusion by what the map has not drawn: the depth maps are rendered from the map's own
  *    terrain tiles, so a ridge off screen does not hide the ground behind it. Shapes and 3D
@@ -55,6 +62,16 @@ open class SensorFrameOverlay : AbstractRenderable("Sensor frames") {
         val occludedColor: Color = Color(0f, 0f, 0f, 0f),
     ) {
         var isEnabled = true
+        /**
+         * The sensor's own image (a photo, or a video texture updated as it plays) projected into
+         * the frame in place of the fill, the image pixel each piece of ground was seen in; null
+         * for none. With occlusion it lands only on ground the sensor sees. Its texture coordinate
+         * transform is honoured (a loaded image's flip, a video surface's transform), and Android
+         * external video textures (`GL_TEXTURE_EXTERNAL_OES`) are supported. The caller owns it.
+         */
+        var image: Texture? = null
+        /** Opacity of [image], 0 to 1. */
+        var imageOpacity = 1f
         // Terrain height range under the frame, refreshed as the sensor moves (for the scissor)
         internal var lowAltitude = 0.0
         internal var highAltitude = 0.0
@@ -97,6 +114,8 @@ open class SensorFrameOverlay : AbstractRenderable("Sensor frames") {
         val d = DrawableSensorFrames.obtain(pool).also {
             it.program = program
             it.outlineWidth = outlineWidth
+            it.imageProgram = rc.getShaderProgram { SensorFrameImageProgram() }
+            it.imageProgramOES = rc.getShaderProgram { SensorFrameImageProgram.OES() }
         }
         for (frame in frames) {
             if (!frame.isEnabled) continue
@@ -111,6 +130,9 @@ open class SensorFrameOverlay : AbstractRenderable("Sensor frames") {
             d.frameParams[4 * k + 1] = tan(sensor.verticalFov.inRadians / 2).toFloat()
             d.frameParams[4 * k + 2] = min(sensor.maxRange, Float.MAX_VALUE.toDouble()).toFloat()
             d.frameParams[4 * k + 3] = sensor.frameNear().toFloat()
+            d.images[k] = frame.image
+            d.imageOpacities[k] = frame.imageOpacity.coerceIn(0f, 1f)
+            frame.image?.let { d.imageTexCoords[k].copy(it.coordTransform) }
             // Where on screen the frame's ground can be: each draw is scissored to it
             updateHeightLimits(rc, frame)
             if (!sensor.groundScreenRect(

@@ -3,7 +3,13 @@ package earth.worldwind.tutorials
 import android.content.res.AssetFileDescriptor
 import android.media.MediaPlayer
 import android.os.Build
+import android.graphics.Color
+import android.os.Bundle
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.ViewGroup
 import android.widget.CheckBox
+import android.widget.FrameLayout
 import earth.worldwind.WorldWind
 import earth.worldwind.WorldWindow
 import earth.worldwind.render.video.MediaSurfaceTexture
@@ -130,6 +136,26 @@ class VideoOnTerrainFragment : BasicGlobeFragment() {
             isChecked = tutorial?.useCameraProjection == true
             setOnCheckedChangeListener { _, on -> tutorial?.useCameraProjection = on }
         }
+    }
+
+    /**
+     * Adds a checkbox over the globe, bottom left, switching the video between the
+     * [earth.worldwind.shape.ProjectedMediaSurface] and the sensor frame overlay
+     * ([VideoOnTerrainTutorial.useSensorFrameOverlay]).
+     */
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
+        val rootView = super.onCreateView(inflater, container, savedInstanceState) ?: return null
+        val overlayToggle = CheckBox(requireContext()).apply {
+            text = "Sensor frame overlay"
+            setTextColor(Color.WHITE)
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+            isChecked = tutorial?.useSensorFrameOverlay == true
+            setOnCheckedChangeListener { _, on -> tutorial?.useSensorFrameOverlay = on }
+        }
+        rootView.findViewById<FrameLayout>(R.id.globe).addView(overlayToggle, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START
+        ).apply { setMargins(24, 24, 24, 24) })
+        return rootView
     }
 
     /** Resolve the 3D-toggle checkbox declared in `activity_main.xml`. */

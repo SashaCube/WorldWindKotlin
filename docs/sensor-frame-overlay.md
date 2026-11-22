@@ -18,11 +18,12 @@ This file records the API, how it works, every approach that was tried with its 
 | `sensor/RayCaster.kt` | First hit of a straight ray on the terrain: max-pyramid walk, exact bilinear crossing per cell, earth curvature |
 | `sensor/DemTileCache.kt` | Shared elevation tiles (256² cells, ~7.7 km at 30 m) with max pyramids, read once in the background, refreshed when the elevation model changes |
 | `sensor/SensorFootprintEngine.kt` | Keeps many sensors' footprints up to date within a time budget a frame, only for sensors that moved |
-| `sensor/SensorFrame.kt` | `Sensor.frameTransform` (world → frame matrix, like a shadow map's light matrix), `frameNear`/`frameFar`, `Sensor.groundScreenRect` (scissor rectangle) |
+| `sensor/SensorFrame.kt` | `Sensor.frameTransform` (world → frame matrix, like a shadow map's light matrix), `frameNear`/`frameFar`, `Sensor.groundScreenRect` (scissor rectangle), `Sensor.setFromPlatformAndSensorPose` (MISB ST 0601 platform + sensor angles) |
 | `sensor/SensorFrameOverlay.kt` | **The renderable**: draws frames on the terrain on the GPU, optional fill and occlusion |
 | `draw/DrawableSensorFrames.kt` | The overlay pass: one pass over the visible terrain tiles, per-tile frame lists, scissored draws |
 | `draw/DrawableSensorFrameDepth.kt` | The occlusion depth pass: each sensor's view of the terrain into a 512² cell of a 2048² depth atlas (up to 16 sensors) |
 | `render/program/SensorFrameProgram.kt` | The overlay shader |
+| `render/program/SensorFrameImageProgram.kt` | Frames carrying the sensor's image (photo or video): one frame per draw, `OES` variant for Android external video textures |
 | `draw/DrawContext.kt` | `sensorFrameDepthFramebuffer` / `sensorFrameDepthTexture` (the atlas), released on context loss |
 | `util/kgl/Kgl.kt` + 6 platforms | `scissor(x, y, width, height)` — `glScissor` was missing from `Kgl` |
 
@@ -60,6 +61,31 @@ What keeps it cheap:
 
 ---
 
+## 2a. The sensor's image in its frame (photo or video)
+
+`SensorFrameOverlay.Frame.image` projects the sensor's own image through its frame, like a slide
+projector: each terrain pixel inside the frame shows the image pixel the camera saw there, so it
+is exact over relief. The image coordinate is the frame's `x/w`, `y/w` mapped to 0..1 (bottom
+left), then the texture's own `coordTransform` (a loaded image's flip, a video surface's
+transform), the same convention as `ProjectedMediaSurface`'s 3D path. With occlusion the image
+lands only on ground the camera sees; ground behind a ridge gets the occluded colour instead of a
+smear of the ridge's pixels. The outline is drawn on top.
+
+- Frames with an image draw one per draw with `SensorFrameImageProgram` (each binds its own
+  texture); plain frames keep batching four to a draw. If the image program cannot be used or
+  the image cannot be bound, the frame falls back to the plain path so its outline still shows.
+- Android video (`OesExternalTexture`, `GL_TEXTURE_EXTERNAL_OES`) uses the `OES` variant. Under
+  GLSL ES 3.00 (needed for the depth-compare samplers) that requires
+  `GL_OES_EGL_image_external_essl3`.
+- `Sensor.setFromPlatformAndSensorPose` composes the KLV platform and sensor angles exactly as
+  `CameraPose.setFromPlatformAndSensorPose` does; a test checks that both give the same image
+  coordinates (to 1e-6) for random poses with roll, so the image's orientation matches.
+- Compared with `ProjectedMediaSurface`: no surface rasterisation into terrain textures each video
+  frame, exact over relief like its 3D path, and occlusion. Same caveat as that 3D path: the KLV
+  pose and FOV must be consistent with the reported corners.
+- The video tutorial (`VideoOnTerrainTutorial`) has a **Toggle sensor frame overlay** action (a
+  checkbox over the map on Android) that draws the same KLV-driven video through the overlay.
+
 ## 3. Using it
 
 ```kotlin
@@ -83,6 +109,19 @@ renderableLayer.addRenderable(overlay)
 // Every telemetry update, on the render thread (or before the next frame):
 sensor.position.copy(newPosition); sensor.azimuth = newAzimuth; sensor.depression = newDepression
 WorldWind.requestRedraw()
+```
+
+The sensor's image in its frame, driven by KLV:
+
+```kotlin
+val frame = overlay.add(sensor, outlineColor = Color(1f, 0.85f, 0f, 1f))
+frame.image = videoTexture        // any Texture; Android: an OesExternalTexture fed by MediaPlayer
+frame.imageOpacity = 1f
+overlay.isOcclusionEnabled = true // keep the video off ground the camera cannot see
+// per KLV sample:
+sensor.position.setDegrees(sensorLat, sensorLon, sensorHeightAboveEllipsoid)
+sensor.horizontalFov = hFov; sensor.verticalFov = vFov
+sensor.setFromPlatformAndSensorPose(platformHeading, platformPitch, platformRoll, relAzimuth, relElevation, relRoll)
 ```
 
 Coordinates of the corners (CPU, against elevation tiles of its own, independent of the map's view):
@@ -199,3 +238,4 @@ Desktop, 1000 drones: ~4.7 fps (map 41 fps), ~1,140 draw calls a frame — each 
 3. Cheaper occlusion: 256² cells, re-render a depth map only when its drone moves.
 4. Validate against recorded flights: compare corners with MISB ST 0601 tags 26–33 / 82–89 and slant range (tag 21), using `ExtractKlv.kt`.
 5. Check the overlay on WebGL.
+6. Images: measure the per-frame cost of a video frame against `ProjectedMediaSurface` on the tablet; consider a fade at the frame's edge (as `ProjectedMediaSurface.fadeMargin`).

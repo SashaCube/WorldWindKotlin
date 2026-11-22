@@ -95,7 +95,7 @@ class HtmlVideoOnTerrainTutorial(engine: WorldWind) : AbstractTutorial(engine) {
     // takes sensor altitude as `MSL + geoid.getOffset(...)`, and the old byte-swapped web
     // geoid returned garbage, so the projection was built on a wrong altitude. If 3D still
     // misrenders, the GPU-precision hypothesis stands - revert to `arrayListOf<String>()`.
-    override val actions = arrayListOf(VideoOnTerrainTutorial.ACTION_TOGGLE_3D)
+    override val actions = arrayListOf(VideoOnTerrainTutorial.ACTION_TOGGLE_3D, VideoOnTerrainTutorial.ACTION_TOGGLE_OVERLAY)
 
     override fun runAction(actionName: String) { inner?.runAction(actionName) }
 

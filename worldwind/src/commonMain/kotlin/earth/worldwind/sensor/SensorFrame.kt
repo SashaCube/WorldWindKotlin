@@ -1,8 +1,11 @@
 package earth.worldwind.sensor
 
+import earth.worldwind.geom.Angle
+import earth.worldwind.geom.Angle.Companion.radians
 import earth.worldwind.geom.Matrix4
 import earth.worldwind.geom.Vec3
 import earth.worldwind.globe.Globe
+import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.floor
@@ -182,3 +185,48 @@ fun Sensor.groundScreenRect(
 
 /** Directions per side of the [groundScreenRect] sampling grid. */
 private const val GRID = 7
+
+/**
+ * Points this sensor the way a gimballed camera on a platform points, from the platform's body
+ * angles and the sensor's angles relative to the platform, as MISB ST 0601 carries them
+ * (platform heading / pitch / roll, tags 5-7 or 90-91; sensor relative azimuth / elevation /
+ * roll, tags 18-20). Both are aerospace 3-2-1 rotations (yaw, pitch, roll; body x forward, y
+ * right, z down), composed the way [earth.worldwind.geom.CameraPose.setFromPlatformAndSensorPose]
+ * composes them, so a sensor set here frames exactly what that camera pose images. Sets
+ * [Sensor.azimuth], [Sensor.depression] and [Sensor.roll]; position and FOV are left as they are.
+ */
+fun Sensor.setFromPlatformAndSensorPose(
+    platformYaw: Angle, platformPitch: Angle, platformRoll: Angle,
+    sensorAzimuth: Angle, sensorElevation: Angle, sensorRoll: Angle,
+): Sensor {
+    // Body forward (+x) and image up (-z), through the sensor then the platform rotation, in NED
+    val forward = doubleArrayOf(1.0, 0.0, 0.0)
+    val up = doubleArrayOf(0.0, 0.0, -1.0)
+    for (v in arrayOf(forward, up)) {
+        rotateBodyToParent(v, sensorAzimuth.inRadians, sensorElevation.inRadians, sensorRoll.inRadians)
+        rotateBodyToParent(v, platformYaw.inRadians, platformPitch.inRadians, platformRoll.inRadians)
+    }
+    // NED -> ENU
+    val fE = forward[1]; val fN = forward[0]; val fU = -forward[2]
+    val uE = up[1]; val uN = up[0]; val uU = -up[2]
+    val horizontal = sqrt(fE * fE + fN * fN)
+    azimuth = atan2(fE, fN).radians.normalize360()
+    depression = atan2(-fU, horizontal).radians
+    // Roll: the image's up against the frame's up at no roll, about the optical axis
+    val f = DoubleArray(3); val r0 = DoubleArray(3); val u0 = DoubleArray(3)
+    sensorFrameAxes(azimuth.inRadians, depression.inRadians, 0.0, f, r0, u0)
+    // With roll ρ the frame's up is u0·cos ρ + r0·sin ρ (see sensorFrameAxes)
+    roll = atan2(uE * r0[0] + uN * r0[1] + uU * r0[2], uE * u0[0] + uN * u0[1] + uU * u0[2]).radians
+    return this
+}
+
+/** Aerospace 3-2-1 (yaw, pitch, roll) body-to-parent rotation of [v] in place. */
+private fun rotateBodyToParent(v: DoubleArray, yaw: Double, pitch: Double, roll: Double) {
+    val cy = cos(yaw); val sy = sin(yaw)
+    val cp = cos(pitch); val sp = sin(pitch)
+    val cr = cos(roll); val sr = sin(roll)
+    val x = cy * cp * v[0] + (cy * sp * sr - sy * cr) * v[1] + (cy * sp * cr + sy * sr) * v[2]
+    val y = sy * cp * v[0] + (sy * sp * sr + cy * cr) * v[1] + (sy * sp * cr - cy * sr) * v[2]
+    val z = -sp * v[0] + cp * sr * v[1] + cp * cr * v[2]
+    v[0] = x; v[1] = y; v[2] = z
+}

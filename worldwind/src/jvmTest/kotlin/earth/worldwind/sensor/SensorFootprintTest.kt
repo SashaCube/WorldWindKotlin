@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
@@ -379,5 +380,53 @@ class SensorFootprintTest {
         }
         println("Scissor: $checked ground points inside their rectangles, $skipped range-limit points skipped")
         assertTrue(checked > 300, "too few ground points checked: $checked")
+    }
+
+    @Test
+    fun sensorFromKlvPoseFramesWhatCameraPoseImages() {
+        val globe = Globe(geoid = NoGeoid)
+        val random = Random(5)
+        val pose = earth.worldwind.geom.CameraPose()
+        var total = 0
+        repeat(50) {
+            val lat = random.nextDouble(-60.0, 60.0)
+            val lon = random.nextDouble(-180.0, 180.0)
+            val alt = random.nextDouble(200.0, 4000.0)
+            val angles = DoubleArray(6) { i -> if (i == 0 || i == 3) random.nextDouble(0.0, 360.0) else random.nextDouble(-40.0, 40.0) }
+            angles[4] = random.nextDouble(-80.0, 10.0) // sensor elevation: mostly looking down
+            val vFov = 30.0
+            val aspect = 1.5 // CameraPose quantises the aspect to 1/1000; 1.5 is exact
+            val hFov = 2 * kotlin.math.atan(aspect * tan(vFov / 2 * PI / 180)) * 180 / PI
+            pose.setFromPlatformAndSensorPose(
+                lat.degrees, lon.degrees, alt, angles[0].degrees, angles[1].degrees, angles[2].degrees,
+                angles[3].degrees, angles[4].degrees, angles[5].degrees, vFov.degrees, aspect,
+            )
+            val sensor = Sensor(
+                Position.fromDegrees(lat, lon, alt), 0.0.degrees, 0.0.degrees, hFov.degrees, vFov.degrees, 10_000.0,
+            ).setFromPlatformAndSensorPose(
+                angles[0].degrees, angles[1].degrees, angles[2].degrees, angles[3].degrees, angles[4].degrees, angles[5].degrees,
+            )
+            val frame = sensor.frameTransform(globe, earth.worldwind.geom.Matrix4())
+            val eye = pose.eyeWorld
+            var compared = 0
+            repeat(40) {
+                val p = Vec3(eye.x + random.nextDouble(-3000.0, 3000.0), eye.y + random.nextDouble(-3000.0, 3000.0), eye.z + random.nextDouble(-3000.0, 3000.0))
+                val c = pose.matrix.m
+                val cw = c[12] * p.x + c[13] * p.y + c[14] * p.z + c[15]
+                val m = frame.m
+                val w = m[12] * p.x + m[13] * p.y + m[14] * p.z + m[15]
+                if (cw <= 100.0 || w <= 100.0) return@repeat // behind or right beside either camera
+                val u = (c[0] * p.x + c[1] * p.y + c[2] * p.z + c[3]) / cw
+                val v = (c[4] * p.x + c[5] * p.y + c[6] * p.z + c[7]) / cw
+                val x = (m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3]) / w
+                val y = (m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7]) / w
+                if (abs(x) > 3.0 || abs(y) > 3.0) return@repeat // far outside the frame
+                assertEquals(2 * u - 1, x, 1e-6, "image x, angles ${angles.toList()}")
+                assertEquals(2 * v - 1, y, 1e-6, "image y, angles ${angles.toList()}")
+                compared++
+            }
+            total += compared
+        }
+        assertTrue(total > 200, "too few points compared: $total")
     }
 }

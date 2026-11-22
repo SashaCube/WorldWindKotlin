@@ -1,11 +1,15 @@
 package earth.worldwind.draw
 
 import earth.worldwind.geom.Matrix4
+import earth.worldwind.geom.Matrix3
+import earth.worldwind.render.Texture
+import earth.worldwind.render.program.SensorFrameImageProgram
 import earth.worldwind.render.program.SensorFrameProgram
 import earth.worldwind.render.program.SensorFrameProgram.Companion.MAX_FRAMES
 import earth.worldwind.util.Pool
 import earth.worldwind.util.kgl.GL_SCISSOR_TEST
 import earth.worldwind.util.kgl.GL_TEXTURE0
+import earth.worldwind.util.kgl.GL_TEXTURE_EXTERNAL_OES
 import kotlin.jvm.JvmStatic
 import kotlin.math.sqrt
 
@@ -24,6 +28,10 @@ import kotlin.math.sqrt
  * Frames with a cell in the depth atlas ([DrawableSensorFrameDepth], rendered earlier in the
  * frame) are occluded: their fill is drawn only where the sensor sees the ground, and their
  * occluded colour where a ridge hides it. The outline is drawn either way.
+ *
+ * A frame with an [image][images] has the image projected into it in place of the fill (one draw
+ * per such frame and tile, [SensorFrameImageProgram]); occlusion keeps the image off ground the
+ * sensor cannot see.
  */
 open class DrawableSensorFrames protected constructor() : Drawable {
     /** World → frame transforms (see `Sensor.frameTransform`), the first [count] used. */
@@ -43,6 +51,15 @@ open class DrawableSensorFrames protected constructor() : Drawable {
     val frameRects = IntArray(4 * MAX_TOTAL)
 
     var program: SensorFrameProgram? = null
+    /** Per frame: the sensor's image projected into its frame, or null for none. */
+    val images = arrayOfNulls<Texture>(MAX_TOTAL)
+    /** Per frame: the image's opacity. */
+    val imageOpacities = FloatArray(MAX_TOTAL)
+    /** Per frame: the image texture's coordinate transform, copied when the frame is set up. */
+    val imageTexCoords = Array(MAX_TOTAL) { Matrix3() }
+    /** Draws frames that carry an image: [SensorFrameImageProgram] and its OES variant. */
+    var imageProgram: SensorFrameImageProgram? = null
+    var imageProgramOES: SensorFrameImageProgram? = null
     private var pool: Pool<DrawableSensorFrames>? = null
     private val mvp = Matrix4()
     private val tileMatrix = Matrix4()
@@ -94,6 +111,9 @@ open class DrawableSensorFrames protected constructor() : Drawable {
     override fun recycle() {
         count = 0
         program = null
+        images.fill(null)
+        imageProgram = null
+        imageProgramOES = null
         pool?.release(this)
         pool = null
     }
@@ -141,6 +161,16 @@ open class DrawableSensorFrames protected constructor() : Drawable {
             statTiles++
             // Terrain vertices are tile-origin-relative; compose in double per tile
             mvp.copy(dc.modelviewProjection).multiplyByTranslation(origin.x, origin.y, origin.z)
+            // Frames with an image draw one by one with the image program; the rest batch below.
+            // A frame whose image cannot be drawn falls back to the batch, so its outline still shows.
+            var plain = 0
+            for (i in 0 until n) {
+                val k = reached[i]
+                if (images[k] == null || !drawImageFrame(dc, terrain, k)) reached[plain++] = k
+            }
+            n = plain
+            if (n == 0) continue
+            if (!program.useProgram(dc)) continue
             program.loadModelviewProjection(mvp)
             var start = 0
             while (start < n) {
@@ -155,7 +185,7 @@ open class DrawableSensorFrames protected constructor() : Drawable {
                     frameParams.copyInto(chunkParams, 4 * j, 4 * k, 4 * k + 4)
                     depthCells.copyInto(chunkCells, 4 * j, 4 * k, 4 * k + 4)
                 }
-                if (!scissorTo(dc, start, size)) { start += size; continue }
+                if (!scissorTo(dc, reached, start, size)) { start += size; continue }
                 program.loadFrames(size, chunkOutline, chunkFill, chunkOccluded, chunkParams, chunkCells)
                 program.loadFrameMatrices(chunkMatrices)
                 terrain.drawTriangles(dc)
@@ -165,14 +195,38 @@ open class DrawableSensorFrames protected constructor() : Drawable {
         }
     }
 
+    /** Draws frame [k] with its image on [terrain]; false if it could not, so it is drawn plain. */
+    private fun drawImageFrame(dc: DrawContext, terrain: DrawableTerrain, k: Int): Boolean {
+        val image = images[k] ?: return false
+        val imageProgram = (if (image.target == GL_TEXTURE_EXTERNAL_OES) imageProgramOES else imageProgram) ?: return false
+        if (!imageProgram.useProgram(dc)) return false
+        dc.activeTextureUnit(GL_TEXTURE0)
+        if (!image.bindTexture(dc)) return false
+        reachedSingle[0] = k
+        if (!scissorTo(dc, reachedSingle, 0, 1)) return true // nothing on screen: done, not a failure
+        val origin = terrain.vertexOrigin
+        imageProgram.loadModelviewProjection(mvp)
+        tileMatrix.copy(frameMatrices[k]).multiplyByTranslation(origin.x, origin.y, origin.z)
+        tileMatrix.transposeToArray(chunkMatrices, 0)
+        imageProgram.loadFrameMatrix(chunkMatrices, 0)
+        imageProgram.loadFrame(
+            outlineWidth, outlineColors, occludedColors, frameParams, depthCells, 4 * k, imageOpacities[k], imageTexCoords[k]
+        )
+        terrain.drawTriangles(dc)
+        statDraws++
+        return true
+    }
+
+    private val reachedSingle = IntArray(1)
+
     /**
-     * Scissors to the union of the screen rectangles of frames `reached[start until start + size]`.
+     * Scissors to the union of the screen rectangles of frames `list[start until start + size]`.
      * False when none of them covers anything on screen, so the draw can be skipped.
      */
-    private fun scissorTo(dc: DrawContext, start: Int, size: Int): Boolean {
+    private fun scissorTo(dc: DrawContext, list: IntArray, start: Int, size: Int): Boolean {
         var x0 = Int.MAX_VALUE; var y0 = Int.MAX_VALUE; var x1 = Int.MIN_VALUE; var y1 = Int.MIN_VALUE
         for (j in 0 until size) {
-            val k = reached[start + j]
+            val k = list[start + j]
             val w = frameRects[4 * k + 2]
             if (w < 0) { // unbounded: the whole viewport
                 dc.gl.disable(GL_SCISSOR_TEST)

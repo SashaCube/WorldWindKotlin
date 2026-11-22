@@ -6,10 +6,14 @@ import earth.worldwind.geom.Angle
 import earth.worldwind.geom.Angle.Companion.degrees
 import earth.worldwind.geom.CameraPose
 import earth.worldwind.geom.Location
+import earth.worldwind.geom.Position
 import earth.worldwind.layer.RenderableLayer
 import earth.worldwind.render.Color
 import earth.worldwind.render.RenderContext
 import earth.worldwind.render.Texture
+import earth.worldwind.sensor.Sensor
+import earth.worldwind.sensor.SensorFrameOverlay
+import earth.worldwind.sensor.setFromPlatformAndSensorPose
 import earth.worldwind.shape.ProjectedMediaSurface
 import earth.worldwind.shape.ShapeAttributes
 import kotlin.math.abs
@@ -69,6 +73,39 @@ open class VideoOnTerrainTutorial(
             if (!value) surface.imageProjection = null
         }
 
+    /**
+     * When `true`, the video is drawn by a [SensorFrameOverlay] in place of the
+     * [ProjectedMediaSurface]: a [Sensor] set from the same KLV pose (as [useCameraProjection]
+     * does) carries the video as its frame's image, so it is projected through the camera's frame
+     * onto the terrain, exact over relief, with the frame outlined, and with occlusion keeping it
+     * off ground the camera cannot see behind a ridge. Needs sensor lat/lon in the KLV; without
+     * them the surface is shown instead.
+     */
+    var useSensorFrameOverlay: Boolean = false
+        set(value) {
+            field = value
+            lastTickTMs = Long.MIN_VALUE // re-apply the current sample to the newly shown path
+            if (!value) {
+                overlayFrame.isEnabled = false
+                surface.isEnabled = true
+            }
+            WorldWind.requestRedraw()
+        }
+
+    /** The camera as a [Sensor], for [useSensorFrameOverlay]; pose and FOV set from KLV each tick. */
+    private val sensor = Sensor(
+        position = Position(), azimuth = Angle.ZERO, depression = 45.0.degrees,
+        horizontalFov = 75.0.degrees, verticalFov = 60.0.degrees, maxRange = 5_000.0,
+    )
+    private val overlay = SensorFrameOverlay().apply {
+        outlineWidth = 2f
+        isOcclusionEnabled = true
+    }
+    private val overlayFrame = overlay.add(sensor, outlineColor = Color(1.0f, 0.85f, 0.0f, 1.0f)).also {
+        it.image = texture
+        it.isEnabled = false
+    }
+
     /** Reusable interpolated sample, written in place by [KlvTimeline.sampleAt]. */
     private val scratchSample = KlvSample()
 
@@ -110,6 +147,7 @@ open class VideoOnTerrainTutorial(
             },
         ).also { it.texture = texture }
         layer.addRenderable(surface)
+        layer.addRenderable(overlay)
     }
 
     override fun start() {
@@ -148,12 +186,49 @@ open class VideoOnTerrainTutorial(
             bottomLeft = imgBl, bottomRight = imgBr, topRight = imgTr, topLeft = imgTl,
         )
         if (useCameraProjection) updateImageProjection(s) else surface.imageProjection = null
+        // The overlay replaces the surface while it has a pose to work from
+        val overlayShown = useSensorFrameOverlay && updateSensor(s)
+        overlayFrame.isEnabled = overlayShown
+        surface.isEnabled = !overlayShown
     }
 
-    override val actions = arrayListOf(ACTION_TOGGLE_3D)
+    override val actions = arrayListOf(ACTION_TOGGLE_3D, ACTION_TOGGLE_OVERLAY)
 
     override fun runAction(actionName: String) {
-        if (actionName == ACTION_TOGGLE_3D) useCameraProjection = !useCameraProjection
+        when (actionName) {
+            ACTION_TOGGLE_3D -> useCameraProjection = !useCameraProjection
+            ACTION_TOGGLE_OVERLAY -> useSensorFrameOverlay = !useSensorFrameOverlay
+        }
+    }
+
+    /**
+     * Sets [sensor] from the sample: position and altitude as [updateImageProjection] resolves
+     * them, the optical axis from the platform and sensor angles, the FOV, and a range reaching
+     * well past the frame's farthest ground corner. False without sensor lat/lon.
+     */
+    private fun updateSensor(s: KlvSample): Boolean {
+        if (s.sLat.isNaN() || s.sLon.isNaN()) return false
+        sensor.position.setDegrees(s.sLat, s.sLon, sensorAltitude(s))
+        sensor.horizontalFov = (if (!s.hFov.isNaN()) s.hFov else 75.0).degrees
+        sensor.verticalFov = (if (!s.vFov.isNaN()) s.vFov else 60.0).degrees
+        sensor.setFromPlatformAndSensorPose(
+            orZero(s.pHdg), orZero(s.pPit), orZero(s.pRol), orZero(s.rAz), orZero(s.rEl), orZero(s.rRol),
+        )
+        var farthest = 0.0
+        for ((lat, lon) in listOf(s.tlLat to s.tlLon, s.trLat to s.trLon, s.brLat to s.brLon, s.blLat to s.blLon)) {
+            if (lat.isNaN() || lon.isNaN()) continue
+            farthest = maxOf(farthest, sensor.position.greatCircleDistance(Location(lat.degrees, lon.degrees)) * 6_371_000.0)
+        }
+        // Slant range: twice the farthest corner's ground distance, plus the height, at least 2 km
+        sensor.maxRange = maxOf(2_000.0, 2 * farthest + sensor.position.altitude)
+        return true
+    }
+
+    /** Sensor height above the ellipsoid: HAE (tag 75), else MSL (tag 15) + geoid, else estimated. */
+    private fun sensorAltitude(s: KlvSample) = when {
+        !s.sHae.isNaN() -> s.sHae
+        !s.sAlt.isNaN() -> s.sAlt + engine.globe.geoid.getOffset(s.sLat.degrees, s.sLon.degrees).toDouble()
+        else -> estimateAltitudeFrom(s)
     }
 
     /**
@@ -169,12 +244,7 @@ open class VideoOnTerrainTutorial(
             surface.imageProjection = null
             return
         }
-        val sAlt = when {
-            !s.sHae.isNaN() -> s.sHae
-            !s.sAlt.isNaN() -> s.sAlt +
-                engine.globe.geoid.getOffset(s.sLat.degrees, s.sLon.degrees).toDouble()
-            else -> estimateAltitudeFrom(s)
-        }
+        val sAlt = sensorAltitude(s)
 
         val vFovDeg = if (!s.vFov.isNaN()) s.vFov else 60.0
         val hFovDeg = if (!s.hFov.isNaN()) s.hFov else 75.0
@@ -244,6 +314,9 @@ open class VideoOnTerrainTutorial(
          * and reads the same string for the label.
          */
         const val ACTION_TOGGLE_3D = "Toggle 3D projection"
+
+        /** Action label for [useSensorFrameOverlay]. */
+        const val ACTION_TOGGLE_OVERLAY = "Toggle sensor frame overlay"
 
         private const val PI_DIV_180 = 0.017453292519943295
         private const val DEFAULT_FALLBACK_ALTITUDE_M = 100.0
